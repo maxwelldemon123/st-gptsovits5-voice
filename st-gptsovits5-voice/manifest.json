@@ -1,0 +1,17 @@
+{
+    "display_name": "GPT-SoVITS v5 角色配音台",
+    "loading_order": 60,
+    "requires": [],
+    "optional": [],
+    "dependencies": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "dsh",
+    "version": "1.0.0",
+    "homePage": "",
+    "auto_update": false,
+    "minimum_client_version": "1.12.0",
+    "hooks": {
+        "activate": "onActivate"
+    }
+}
