@@ -44,7 +44,10 @@ const DEFAULTS = Object.freeze({
     stripActions: true,
     readQuotedOnly: false,
     maxChars: 200,
-    textLang: 'auto',
+    /** 输出语言：auto = 跟随文本，其余为 GPT-SoVITS 支持的语种 */
+    outputLang: 'auto',
+    /** 输出语言与文本语言不一致时，先用酒馆当前模型翻译再合成 */
+    translate: false,
     splitMethod: 'cut5',
     timeoutMs: 180000,
     fallbackProfileId: '',
@@ -100,6 +103,10 @@ function getSettings() {
     for (const key of Object.keys(DEFAULTS)) {
         if (!Object.hasOwn(s, key)) s[key] = structuredClone(DEFAULTS[key]);
     }
+    // 旧版字段迁移：textLang → outputLang
+    if (typeof s.textLang === 'string' && s.textLang !== 'auto' && s.outputLang === 'auto') {
+        s.outputLang = s.textLang;
+    }
     if (!Array.isArray(s.profiles)) s.profiles = [];
     if (!s.bindings || typeof s.bindings !== 'object') s.bindings = {};
     if (!s.adv || typeof s.adv !== 'object') s.adv = structuredClone(DEFAULTS.adv);
@@ -153,6 +160,63 @@ async function setWeights(profile, signal) {
     setStatus(`已切换权重：${profile.name || profile.id}`, 'ok');
 }
 
+/** 翻译缓存：同语言 + 同文本只翻一次 */
+const translateCache = new Map();
+
+function langLabel(id) {
+    return LANGUAGES.find(l => l.id === id)?.label ?? id;
+}
+
+/**
+ * 决定这次合成用哪种语言。
+ * @param {string} setting auto | zh | ja | en | ko | yue
+ * @param {string} text
+ * @returns {string}
+ */
+function resolveOutputLang(setting, text) {
+    return !setting || setting === 'auto' ? detectLang(text) : setting;
+}
+
+/**
+ * 用酒馆当前的模型把台词翻译成目标语言（只输出译文）。
+ * 注意：GPT-SoVITS 的 text_lang 是"文本的语言"，不翻译就不可能真的念成另一种语言。
+ * @param {string} text
+ * @param {string} target
+ * @returns {Promise<string>}
+ */
+async function translateText(text, target) {
+    const key = `${target}\u0001${text}`;
+    if (translateCache.has(key)) return translateCache.get(key);
+
+    const c = ctx();
+    const fn = c?.generateQuietPrompt;
+    if (typeof fn !== 'function') {
+        throw new Error('当前酒馆没有 generateQuietPrompt，无法翻译；把输出语言改回「跟随文本」');
+    }
+
+    const prompt = `Translate the following line into ${langLabel(target)} (${target}). `
+        + 'Keep the tone and emotion. Output ONLY the translated line, no quotes, no notes.\n\n'
+        + text;
+
+    let out;
+    try {
+        out = await fn({ quietPrompt: prompt, quietName: 'translate', responseLength: Math.max(64, Math.min(1024, text.length * 3)) });
+    } catch (err) {
+        // 老版本签名：generateQuietPrompt(prompt, skipWIAN, responseLength)
+        out = await fn(prompt, true);
+    }
+
+    const cleaned = String(out ?? '')
+        .trim()
+        .replace(/^["“”「『]+|["“”」』]+$/g, '')
+        .trim();
+    if (!cleaned) throw new Error('翻译返回空内容');
+
+    translateCache.set(key, cleaned);
+    while (translateCache.size > 64) translateCache.delete(translateCache.keys().next().value);
+    return cleaned;
+}
+
 /**
  * 合成一段文本（走队列 + 缓存）。
  * @param {string} text
@@ -162,9 +226,20 @@ async function setWeights(profile, signal) {
  * @returns {Promise<Blob>}
  */
 async function synthesize(text, profile, opts, signal) {
-    const textLang = opts.textLang === 'auto' || !opts.textLang ? detectLang(text) : opts.textLang;
+    const target = resolveOutputLang(opts.textLang, text);
     const speed = clampSpeed(opts.speed);
-    const key = cacheKey(profile, { text, textLang, speed });
+
+    // 目标语言 ≠ 文本语言：要么翻译，要么如实按原文念（不是"换语言"）
+    let speakText = text;
+    if (target !== detectLang(text)) {
+        if (settings.translate) {
+            speakText = await translateText(text, target);
+        } else {
+            console.info(`[GPTSoVITS5] 输出语言=${target} 与文本不一致，未开翻译，按原文合成`);
+        }
+    }
+
+    const key = cacheKey(profile, { text: speakText, textLang: target, speed });
 
     const hit = audioCache.get(key);
     if (hit) {
@@ -178,8 +253,8 @@ async function synthesize(text, profile, opts, signal) {
         await setWeights(profile, signal);
 
         const body = {
-            text,
-            text_lang: textLang,
+            text: speakText,
+            text_lang: target,
             ref_audio_path: profile.refAudio,
             prompt_text: profile.promptText,
             prompt_lang: profile.promptLang || 'ja',
@@ -374,7 +449,7 @@ function slotConfig(binding, slotId) {
     return {
         profile,
         speed: clampSpeed(cfg.speed ?? 1),
-        textLang: cfg.textLang || settings.textLang || 'auto',
+        textLang: cfg.textLang || settings.outputLang || 'auto',
     };
 }
 
@@ -821,13 +896,56 @@ async function writeSlotsToCard(specText) {
     }
 }
 
+/* ---- 一键启动（辅助） ---- */
+
+/**
+ * 扩展在本机的真实路径（插件里附带 server\start-all.bat）。
+ * @returns {string}
+ */
+function extensionRootPath() {
+    try {
+        const url = new URL('.', import.meta.url);
+        let p = decodeURIComponent(url.pathname);
+        if (/^\/[A-Za-z]:/.test(p)) p = p.slice(1);          // /E:/xxx → E:/xxx
+        return p.replace(/\//g, '\\').replace(/\\+$/, '');
+    } catch {
+        return '';
+    }
+}
+
+/**
+ * 显示 / 复制一键启动脚本的路径（浏览器不允许网页直接执行本地 bat，
+ * 所以这里做到"帮你把路径找出来并复制"，双击那一下仍然要你自己点）。
+ */
+async function showLauncherPath() {
+    const root = extensionRootPath();
+    const batPath = root ? `${root}\\server\\start-all.bat` : 'st-gptsovits5-voice\\server\\start-all.bat';
+    try {
+        await navigator.clipboard.writeText(batPath);
+        toast('success', `启动脚本路径已复制：${batPath}`);
+    } catch {
+        toast('info', `启动脚本：${batPath}`);
+    }
+    setStatus('双击 start-all.bat → 等两个黑窗口起来 → 再点测试连接', '');
+}
+
+function applyServerUrl(url) {
+    settings.serverUrl = url;
+    const input = document.getElementById('g5-server');
+    if (input) input.value = url;
+    loadedWeights = { gpt: '', sovits: '' };
+    audioCache.clear();
+    save();
+    doProbe();
+}
+
 /* ---- 面板 ---- */
 
 function buildPanel() {
     const panel = h('div', { id: 'g5-panel', class: 'g5-panel' });
 
     const serverInput = h('input', {
-        type: 'text', class: 'g5-input', value: settings.serverUrl, placeholder: 'http://127.0.0.1:9880',
+        type: 'text', class: 'g5-input', id: 'g5-server', value: settings.serverUrl, placeholder: 'http://127.0.0.1:9880',
     });
     serverInput.addEventListener('change', () => {
         settings.serverUrl = serverInput.value.trim();
@@ -846,8 +964,17 @@ function buildPanel() {
         serverInput,
         h('div', { class: 'g5-row-inline' }, [
             h('button', { class: 'g5-btn', text: '测试连接', onclick: () => doProbe() }),
+            h('button', { class: 'g5-btn', text: '直连 9880', onclick: () => applyServerUrl('http://127.0.0.1:9880') }),
+            h('button', { class: 'g5-btn', text: '中继 9881', onclick: () => applyServerUrl('http://127.0.0.1:9881') }),
+            h('button', { class: 'g5-btn', text: '一键启动脚本', onclick: () => showLauncherPath() }),
+        ]),
+        h('div', { class: 'g5-row-inline' }, [
             h('span', { class: 'g5-muted', id: 'g5-route', text: '' }),
         ]),
+        h('div', {
+            class: 'g5-hint',
+            text: '一键启动：双击插件目录里的 server\\start-all.bat（会同时拉起 api_v2 与中继），然后点「中继 9881」→「测试连接」。',
+        }),
     ]);
 
     const profilesBlock = h('div', { class: 'g5-block' }, [
@@ -888,8 +1015,19 @@ function buildPanel() {
         save();
     });
 
-    const textLang = h('select', { class: 'g5-select g5-select-narrow' }, langOptions(settings.textLang || 'auto', true));
-    textLang.addEventListener('change', () => { settings.textLang = textLang.value; save(); });
+    const textLang = h('select', { class: 'g5-select g5-select-narrow' }, langOptions(settings.outputLang || 'auto', true));
+    textLang.addEventListener('change', () => {
+        settings.outputLang = textLang.value;
+        save();
+        refreshCurrentCard();
+    });
+
+    const translateBox = h('input', { type: 'checkbox' });
+    translateBox.checked = Boolean(settings.translate);
+    translateBox.addEventListener('change', () => {
+        settings.translate = translateBox.checked;
+        save();
+    });
 
     const splitMethod = h('select', { class: 'g5-select g5-select-narrow' }, ['cut0', 'cut1', 'cut2', 'cut3', 'cut4', 'cut5'].map(v =>
         h('option', { value: v, text: v, selected: (settings.splitMethod || 'cut5') === v })));
@@ -918,7 +1056,8 @@ function buildPanel() {
         h('label', { class: 'g5-check' }, [stripActions, h('span', { text: '去掉（动作描写）与 *星号动作*' })]),
         h('label', { class: 'g5-check' }, [quotedOnly, h('span', { text: '只朗读引号内的台词' })]),
         h('label', { class: 'g5-field' }, [h('span', { text: '单段最大字数' }), maxChars]),
-        h('label', { class: 'g5-field' }, [h('span', { text: '文本语言' }), textLang]),
+        h('label', { class: 'g5-field' }, [h('span', { text: '输出语言' }), textLang]),
+        h('label', { class: 'g5-check' }, [translateBox, h('span', { text: '语言不一致时先翻译再合成（用当前对话模型）' })]),
         h('label', { class: 'g5-field' }, [h('span', { text: '切分方法' }), splitMethod]),
         h('label', { class: 'g5-field' }, [h('span', { text: '未绑定时的默认档案' }), fallback]),
         h('details', { class: 'g5-details' }, [
